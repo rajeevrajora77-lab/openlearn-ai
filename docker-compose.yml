@@ -1,0 +1,266 @@
+version: '3.8'
+
+services:
+  # ======================
+  # DATABASES
+  # ======================
+  
+  postgres:
+    image: postgres:16-alpine
+    container_name: openlearn-postgres
+    environment:
+      POSTGRES_USER: openlearn
+      POSTGRES_PASSWORD: dev_password_change_in_production
+      POSTGRES_DB: openlearn_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openlearn"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openlearn-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: openlearn-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - openlearn-network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: openlearn-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    networks:
+      - openlearn-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: openlearn-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - openlearn-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: openlearn-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: openlearn
+      RABBITMQ_DEFAULT_PASS: dev_password
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - openlearn-network
+
+  # ======================
+  # CORE SERVICES
+  # ======================
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: openlearn-auth
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://openlearn:dev_password_change_in_production@postgres:5432/openlearn_db
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=change_this_in_production
+      - PORT=8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - openlearn-network
+    volumes:
+      - ./services/auth-service:/app
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
+
+  content-service:
+    build:
+      context: ./services/content-service
+      dockerfile: Dockerfile
+    container_name: openlearn-content
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://openlearn:dev_password_change_in_production@postgres:5432/openlearn_db
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - PORT=8002
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - openlearn-network
+    volumes:
+      - ./services/content-service:/app
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8002 --reload
+
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    container_name: openlearn-user
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=postgresql://openlearn:dev_password_change_in_production@postgres:5432/openlearn_db
+      - REDIS_URL=redis://redis:6379
+      - PORT=8003
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - openlearn-network
+    volumes:
+      - ./services/user-service:/app
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload
+
+  # ======================
+  # AI/ML SERVICES
+  # ======================
+
+  ai-tutor:
+    build:
+      context: ./services/ai-tutor
+      dockerfile: Dockerfile
+    container_name: openlearn-ai-tutor
+    ports:
+      - "9001:9001"
+    environment:
+      - DATABASE_URL=postgresql://openlearn:dev_password_change_in_production@postgres:5432/openlearn_db
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+      - LLM_MODEL=mistralai/Mistral-7B-Instruct-v0.2
+      - PORT=9001
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    networks:
+      - openlearn-network
+    volumes:
+      - ./services/ai-tutor:/app
+      - model_cache:/root/.cache
+    command: uvicorn src.main:app --host 0.0.0.0 --port 9001 --reload
+
+  # ======================
+  # FRONTEND
+  # ======================
+
+  web:
+    build:
+      context: ./frontend/web
+      dockerfile: Dockerfile.dev
+    container_name: openlearn-web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=development
+    volumes:
+      - ./frontend/web:/app
+      - /app/node_modules
+    networks:
+      - openlearn-network
+    command: npm run dev
+
+  # ======================
+  # MONITORING (Optional for local dev)
+  # ======================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: openlearn-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - openlearn-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: openlearn-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - openlearn-network
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  minio_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+  model_cache:
+
+networks:
+  openlearn-network:
+    driver: bridge
